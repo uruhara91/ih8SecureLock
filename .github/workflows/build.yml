@@ -1,0 +1,163 @@
+name: Build ih8SecureLock
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch: {}
+
+# Least-privilege default for every job; only the release job (below) opts
+# back into `contents: write`, and only for itself.
+permissions:
+  contents: read
+
+# A new push/PR update cancels the still-running previous one instead of
+# letting both race to completion and burn runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # r27 is the current NDK LTS branch (long support window), used instead of
+  # always chasing the newest non-LTS release — a better fit for "robust"
+  # than a toolchain that churns every few months. Bump deliberately.
+  NDK_VERSION: r27d
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Static analysis on our own sources. Runs first and gates the build job
+  # (see `needs:` below) so a real bug is caught before spending time
+  # cross-compiling four ABIs.
+  # ---------------------------------------------------------------------
+  lint:
+    name: Static analysis (cppcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cppcheck
+
+      - name: cppcheck — module.cpp, binder.cpp, binder.hpp
+        working-directory: zygisk/jni
+        run: |
+          cppcheck \
+            --language=c++ --std=c++20 \
+            --enable=warning,style,performance,portability \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            --suppress=noConstructor:zygisk.hpp \
+            --suppress=noExplicitConstructor:zygisk.hpp \
+            --error-exitcode=1 \
+            module.cpp binder.cpp binder.hpp
+        # Only module.cpp/binder.cpp/binder.hpp are listed above, but that
+        # does NOT stop cppcheck from also analyzing zygisk.hpp: it's pulled
+        # in via #include from module.cpp, and cppcheck reports findings
+        # from included headers too, attributed to the header file. This is
+        # what broke the build (noConstructor/noExplicitConstructor firing
+        # on zygisk.hpp's Api/module_abi types, which we don't own and won't
+        # change — see the Android.mk comment on -Werror for the same
+        # vendored-header reasoning). The two explicit --suppress entries
+        # above silence exactly those two IDs on that one file; every other
+        # check still runs on zygisk.hpp as a safety net, so a genuine new
+        # problem surfacing there (e.g. after bumping the vendored copy)
+        # still fails the build instead of being silently swallowed.
+
+  # ---------------------------------------------------------------------
+  # Cross-compile all four ABIs and assemble the installable module zip.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build (all ABIs)
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Android NDK ${{ env.NDK_VERSION }}
+        id: setup-ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+          # local-cache was removed on purpose, not an oversight: it's a
+          # confirmed-broken feature in this action (upstream issue #547,
+          # https://github.com/nttld/setup-ndk/issues/547) that can corrupt
+          # symlinks when restoring the cached NDK. `clang++` in the NDK's
+          # LLVM toolchain is itself a symlink to `clang` — a bad restore
+          # leaves it dangling, which is exactly the "clang++: No such file
+          # or directory" failure this fixes. Cost: every run re-downloads
+          # + re-extracts the NDK instead of pulling a warm cache (the
+          # in-run tool-cache from `tc.cacheDir()` still applies within a
+          # single job, just not carried across separate workflow runs) —
+          # a slower but always-correct build beats a fast but silently
+          # broken one.
+
+      - name: Build + package module
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        # chmod explicitly instead of trusting the bit survived the trip
+        # from repo to runner: it's dropped by GitHub's web upload UI,
+        # by Windows checkouts, and by `git config core.fileMode false` —
+        # none of which are visible locally, so "it works on my machine"
+        # doesn't guarantee it here. This is what "Permission denied" on
+        # `./scripts/package_module.sh` means.
+        run: |
+          chmod +x scripts/package_module.sh
+          ./scripts/package_module.sh
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ih8SecureLock-module
+          path: |
+            ih8SecureLock-*.zip
+            ih8SecureLock-*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload debug symbols (unstripped, per-ABI)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: debug-symbols
+          path: debug-symbols/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Tag-triggered release. Uses the built-in `gh` CLI + GITHUB_TOKEN instead
+  # of a third-party release-publishing action, on purpose: one less
+  # external dependency to trust for the step that has write access.
+  # ---------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download module zip
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ih8SecureLock-module
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            ih8SecureLock-*.zip ih8SecureLock-*.zip.sha256 \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --repo "${GITHUB_REPOSITORY}"

@@ -39,42 +39,70 @@ static bool getTransactionCodes(JNIEnv* env) {
     return true;
 }
 
-int (*transactOrig)(void*, int32_t, uint32_t, void*, void*, uint32_t);
+int (*transactOrig)(void*, int32_t, uint32_t, void*, void*, uint32_t) = nullptr;
 
 int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
-    auto pparcel = (PParcel*)pdata;
-    auto parcel = FakeParcel(pparcel->data);
-
-    size_t binder_headers_len = getBinderHeadersLen(sdk);
-    if (pparcel->data_size < binder_headers_len + 4) {
+    // Hot-path fast-reject: IPCThreadState::transact is hooked process-wide,
+    // so this runs for *every* Binder call the app makes, not just the two
+    // or three we care about. The original code unconditionally parsed the
+    // parcel header + interface descriptor before ever looking at `code`,
+    // which means every unrelated transaction paid for work whose result
+    // was thrown away. A plain integer compare is essentially free and
+    // rejects the overwhelming majority of calls immediately.
+    //
+    // code == 0 is also rejected outright: real AIDL transaction codes start
+    // at FIRST_CALL_TRANSACTION (1), so 0 can only mean one of the
+    // relayout_code/registerScreenCaptureObserver_code lookups failed at
+    // startup and is still sitting at its zero-initialized default -- in
+    // that case we must never let it "match" an unrelated call by accident.
+    if (likely(code == 0 || (code != relayout_code && code != relayoutAsync_code &&
+                              code != registerScreenCaptureObserver_code))) {
         return transactOrig(self, handle, code, pdata, preply, flags);
     }
-    parcel.skip(binder_headers_len);  // header
+
+    auto pparcel = reinterpret_cast<PParcel*>(pdata);
+    if (unlikely(pparcel == nullptr || pparcel->data == nullptr)) {
+        return transactOrig(self, handle, code, pdata, preply, flags);
+    }
+
+    auto parcel = FakeParcel(pparcel->data, pparcel->data_size);
+    parcel.skip((uint32_t)getBinderHeadersLen(sdk));  // header
 
     auto descLen = parcel.readInt32();
     auto desc = parcel.readString16(descLen);
 
-    if ((code == relayout_code || code == relayoutAsync_code) &&
-        STR_LEN(I_WINDOW_SESSION_DESC) == descLen &&
-        memcmp(desc, I_WINDOW_SESSION_DESC, descLen * sizeof(char16_t)) == 0) {
-        // remove FLAG_SECURE mask
+    // Every skip/read above is bounds-checked internally by FakeParcel; if
+    // any of them ran past the end of the parcel (unexpected/short buffer,
+    // different Android version, etc.) `ok()` is false and `desc` is null.
+    // Falling back to the real transact is always safe -- we just don't get
+    // to touch FLAG_SECURE or the capture-observer call for this one call.
+    if (unlikely(!parcel.ok() || desc == nullptr)) {
+        return transactOrig(self, handle, code, pdata, preply, flags);
+    }
 
-        parcel.skipFlatObj();                              // IWindow flat obj
-        if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq
-        parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams
-        parcel.skip(3 * sizeof(uint32_t));                 // requestedWidth, requestedHeight, viewVisibility
+    if (code == relayout_code || code == relayoutAsync_code) {
+        if (STR_LEN(I_WINDOW_SESSION_DESC) == descLen &&
+            memcmp(desc, I_WINDOW_SESSION_DESC, descLen * sizeof(char16_t)) == 0) {
+            // remove FLAG_SECURE mask
 
-        auto* flags = parcel.peekInt32Ref();
-        if (*flags & FLAG_SECURE) {
-            *flags &= ~FLAG_SECURE;
-            LOGD("Bypassed secure lock");
+            parcel.skipFlatObj();                              // IWindow flat obj
+            if (sdk <= 30) parcel.skip(1 * sizeof(uint32_t));  // seq
+            parcel.skip(4 * sizeof(uint32_t));                 // LayoutParams
+            parcel.skip(3 * sizeof(uint32_t));  // requestedWidth, requestedHeight, viewVisibility
+
+            auto* pflags = parcel.peekInt32Ref();
+            if (parcel.ok() && pflags != nullptr && (*pflags & FLAG_SECURE)) {
+                *pflags &= ~FLAG_SECURE;
+                LOGD("Bypassed secure lock");
+            }
         }
-    } else if (code == registerScreenCaptureObserver_code &&
-               STR_LEN(I_ACTIVITY_TASKMANAGER_DESC) == descLen &&
-               memcmp(desc, I_ACTIVITY_TASKMANAGER_DESC, descLen * sizeof(char16_t)) == 0) {
-        // early-return from capture listener
-        LOGD("Bypassed screenshot listener");
-        return 0;
+    } else {  // code == registerScreenCaptureObserver_code
+        if (STR_LEN(I_ACTIVITY_TASKMANAGER_DESC) == descLen &&
+            memcmp(desc, I_ACTIVITY_TASKMANAGER_DESC, descLen * sizeof(char16_t)) == 0) {
+            // early-return from capture listener
+            LOGD("Bypassed screenshot listener");
+            return 0;
+        }
     }
     return transactOrig(self, handle, code, pdata, preply, flags);
 }
@@ -88,9 +116,18 @@ static bool hookBinder(zygisk::Api* api) {
     }
 
     api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
-                         (void**)&transactHook, (void**)&transactOrig);
+                         reinterpret_cast<void*>(&transactHook), reinterpret_cast<void**>(&transactOrig));
     if (!api->pltHookCommit()) {
         LOGD("ERROR: pltHookCommit");
+        return false;
+    }
+    // pltHookCommit() succeeding only means the hook table was committed; it
+    // doesn't guarantee the symbol was actually found in libbinder.so on
+    // this particular Android build/ABI. If it wasn't, transactOrig is still
+    // null and every subsequent transactHook() call would crash the app the
+    // instant it does any Binder IPC. Fail closed instead.
+    if (!transactOrig) {
+        LOGD("ERROR: transact symbol not resolved, refusing to run unhooked");
         return false;
     }
     return true;
@@ -109,9 +146,9 @@ static bool run(zygisk::Api* api, JNIEnv* env) {
 
 class ih8SecureLock : public zygisk::ModuleBase {
    public:
-    void onLoad(zygisk::Api* api, JNIEnv* env) override {
-        this->api = api;
-        this->env = env;
+    void onLoad(zygisk::Api* api_in, JNIEnv* env_in) override {
+        this->api = api_in;
+        this->env = env_in;
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs* args) override {
@@ -120,18 +157,37 @@ class ih8SecureLock : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
+        if (unlikely(args->nice_name == nullptr)) {
+            // Nothing to hook without a process name to attribute logs to;
+            // bail out rather than pass a null jstring into JNI.
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
         PROC_NAME = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (unlikely(PROC_NAME == nullptr)) {
+            // Out of memory or similar JNI failure; nothing more we can
+            // safely do (and nothing left to release).
+            api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+            return;
+        }
+
         if (!run(api, env)) {
             api->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
             env->ReleaseStringUTFChars(args->nice_name, PROC_NAME);
+            PROC_NAME = "";
         } else {
+            // Intentionally NOT releasing PROC_NAME here: the module stays
+            // resident in this process (DLCLOSE was not requested) and
+            // transactHook()'s LOGD keeps referencing PROC_NAME for the
+            // lifetime of the process, so its backing chars must stay alive.
             LOGD("Loaded");
         }
     }
 
    private:
-    zygisk::Api* api;
-    JNIEnv* env;
+    zygisk::Api* api = nullptr;
+    JNIEnv* env = nullptr;
 };
 
 REGISTER_ZYGISK_MODULE(ih8SecureLock)
