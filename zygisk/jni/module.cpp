@@ -25,7 +25,7 @@ static int sdk = 0;
 // UINT32_MAX (never a real AIDL transaction code -- those run from
 // FIRST_CALL_TRANSACTION=1 to LAST_CALL_TRANSACTION=0x00FFFFFF) is the
 // "lookup failed / not applicable" sentinel, not 0. This lets
-// transactHook()'s hot-path fast-reject do a plain 3-way compare against
+// transactHook()'s hot-path fast-reject do a plain N-way compare against
 // `code` with no separate failure case to special-case -- see below.
 static uint32_t relayout_code = UINT32_MAX;
 static uint32_t relayoutAsync_code = UINT32_MAX;
@@ -111,6 +111,17 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
         return transactOrig(self, handle, code, pdata, preply, flags);
     }
 
+    // Note on the branching below: transaction codes are numbered
+    // per-interface (each AIDL interface starts its own numbering at
+    // FIRST_CALL_TRANSACTION=1), so it's entirely normal for e.g.
+    // relayout_code and registerScreenRecordingCallback_code to end up
+    // numerically equal by coincidence -- they come from two unrelated
+    // interfaces (IWindowSession vs IWindowManager). The interface
+    // descriptor comparison inside each branch is what actually
+    // disambiguates; if `code` matches a branch but the descriptor doesn't,
+    // that branch's inner `if` is simply false and we fall through to the
+    // ordinary transactOrig() at the bottom, i.e. worst case on a coincidental
+    // code collision is "no bypass applied for this call", never a crash.
     if (code == relayout_code || code == relayoutAsync_code) {
         if (STR_LEN(I_WINDOW_SESSION_DESC) == descLen &&
             memcmp(desc, I_WINDOW_SESSION_DESC, descLen * sizeof(char16_t)) == 0) {
@@ -127,11 +138,26 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
                 LOGD("Bypassed secure lock");
             }
         }
-    } else {  // code == registerScreenCaptureObserver_code
+    } else if (code == registerScreenCaptureObserver_code) {
         if (STR_LEN(I_ACTIVITY_TASKMANAGER_DESC) == descLen &&
             memcmp(desc, I_ACTIVITY_TASKMANAGER_DESC, descLen * sizeof(char16_t)) == 0) {
             // early-return from capture listener
             LOGD("Bypassed screenshot listener");
+            return 0;
+        }
+    } else {  // code == registerScreenRecordingCallback_code
+        if (STR_LEN(I_WINDOW_MANAGER_DESC) == descLen &&
+            memcmp(desc, I_WINDOW_MANAGER_DESC, descLen * sizeof(char16_t)) == 0) {
+            // registerScreenRecordingCallback(IScreenRecordingCallback)
+            // returns boolean (whether recording is active). An untouched,
+            // empty reply is correct here, not just convenient: both
+            // Parcel.readException() and a boolean AIDL result read compile
+            // down to Parcel::readInt32(), which is documented to default
+            // to 0 on underflow rather than throw (readAligned<T>() in
+            // frameworks/native/libs/binder/Parcel.cpp). Empty reply -> "no
+            // exception" + "false", i.e. exactly the "not being recorded"
+            // result we want -- no reply-parcel writing needed.
+            LOGD("Bypassed screen recording listener");
             return 0;
         }
     }
