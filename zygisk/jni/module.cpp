@@ -1,5 +1,6 @@
 #include <android/log.h>
 #include <jni.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "binder.hpp"
@@ -20,19 +21,34 @@
 #define I_ACTIVITY_TASKMANAGER_DESC u"android.app.IActivityTaskManager"
 
 static int sdk = 0;
-static uint32_t relayout_code = 0;
-static uint32_t relayoutAsync_code = 0;
-static uint32_t registerScreenCaptureObserver_code = 0;
+// UINT32_MAX (never a real AIDL transaction code -- those run from
+// FIRST_CALL_TRANSACTION=1 to LAST_CALL_TRANSACTION=0x00FFFFFF) is the
+// "lookup failed / not applicable" sentinel, not 0. This lets
+// transactHook()'s hot-path fast-reject do a plain 3-way compare against
+// `code` with no separate failure case to special-case -- see below.
+static uint32_t relayout_code = UINT32_MAX;
+static uint32_t relayoutAsync_code = UINT32_MAX;
+static uint32_t registerScreenCaptureObserver_code = UINT32_MAX;
 
 static const char* PROC_NAME = "";
 
-static bool getTransactionCodes(JNIEnv* env) {
-    relayout_code = getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayout"));
-    relayoutAsync_code = getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayoutAsync"));
-    registerScreenCaptureObserver_code =
-        getStaticIntFieldJni(env, STUB("android/app/IActivityTaskManager"), TRSCTN("registerScreenCaptureObserver"));
+// getStaticIntFieldJni() returns 0 both on genuine lookup failure and on
+// the (never-happens-in-practice) case of an actual field value of 0;
+// either way 0 is not a code transactHook() should ever match against, so
+// remap it to the UINT32_MAX sentinel right here, once at init time,
+// rather than re-checking `code == 0` on every single Binder transaction
+// in the process for the rest of its life.
+static inline uint32_t toSentinel(uint32_t code) { return code == 0 ? UINT32_MAX : code; }
 
-    if (registerScreenCaptureObserver_code == 0 && relayoutAsync_code == 0 && relayout_code == 0) {
+static bool getTransactionCodes(JNIEnv* env) {
+    relayout_code = toSentinel(getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayout")));
+    relayoutAsync_code =
+        toSentinel(getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayoutAsync")));
+    registerScreenCaptureObserver_code = toSentinel(getStaticIntFieldJni(
+        env, STUB("android/app/IActivityTaskManager"), TRSCTN("registerScreenCaptureObserver")));
+
+    if (registerScreenCaptureObserver_code == UINT32_MAX && relayoutAsync_code == UINT32_MAX &&
+        relayout_code == UINT32_MAX) {
         LOGD("ERROR getTransactionCodes: Could not get any transaction codes");
         return false;
     }
@@ -50,13 +66,13 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
     // was thrown away. A plain integer compare is essentially free and
     // rejects the overwhelming majority of calls immediately.
     //
-    // code == 0 is also rejected outright: real AIDL transaction codes start
-    // at FIRST_CALL_TRANSACTION (1), so 0 can only mean one of the
-    // relayout_code/registerScreenCaptureObserver_code lookups failed at
-    // startup and is still sitting at its zero-initialized default -- in
-    // that case we must never let it "match" an unrelated call by accident.
-    if (likely(code == 0 || (code != relayout_code && code != relayoutAsync_code &&
-                              code != registerScreenCaptureObserver_code))) {
+    // A failed transaction-code lookup sentinels to UINT32_MAX (see
+    // toSentinel() above), which real AIDL transaction codes can never
+    // equal (they run 1..0x00FFFFFF) -- so a failed lookup simply never
+    // matches any real `code` here, with no separate `code == 0` check
+    // needed on this per-call path.
+    if (likely(code != relayout_code && code != relayoutAsync_code &&
+               code != registerScreenCaptureObserver_code)) {
         return transactOrig(self, handle, code, pdata, preply, flags);
     }
 
