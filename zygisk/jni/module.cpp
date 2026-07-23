@@ -19,6 +19,7 @@
 
 #define I_WINDOW_SESSION_DESC u"android.view.IWindowSession"
 #define I_ACTIVITY_TASKMANAGER_DESC u"android.app.IActivityTaskManager"
+#define I_WINDOW_MANAGER_DESC u"android.view.IWindowManager"
 
 static int sdk = 0;
 // UINT32_MAX (never a real AIDL transaction code -- those run from
@@ -29,6 +30,17 @@ static int sdk = 0;
 static uint32_t relayout_code = UINT32_MAX;
 static uint32_t relayoutAsync_code = UINT32_MAX;
 static uint32_t registerScreenCaptureObserver_code = UINT32_MAX;
+// Android 15+ (VANILLA_ICE_CREAM) screen-*record*-detection counterpart to
+// registerScreenCaptureObserver above -- see IWindowManager.aidl's
+// registerScreenRecordingCallback(IScreenRecordingCallback), which backs the
+// public WindowManager#addScreenRecordingCallback() API. On pre-15 devices
+// android.view.IWindowManager$Stub simply has no
+// TRANSACTION_registerScreenRecordingCallback field, so the lookup below
+// fails exactly like any other unavailable transaction and this sentinels
+// to UINT32_MAX -- safe to probe for unconditionally, no explicit SDK-gate
+// needed (mirrors how registerScreenCaptureObserver already degrades on
+// pre-14 devices).
+static uint32_t registerScreenRecordingCallback_code = UINT32_MAX;
 
 static const char* PROC_NAME = "";
 
@@ -46,9 +58,11 @@ static bool getTransactionCodes(JNIEnv* env) {
         toSentinel(getStaticIntFieldJni(env, STUB("android/view/IWindowSession"), TRSCTN("relayoutAsync")));
     registerScreenCaptureObserver_code = toSentinel(getStaticIntFieldJni(
         env, STUB("android/app/IActivityTaskManager"), TRSCTN("registerScreenCaptureObserver")));
+    registerScreenRecordingCallback_code = toSentinel(
+        getStaticIntFieldJni(env, STUB("android/view/IWindowManager"), TRSCTN("registerScreenRecordingCallback")));
 
     if (registerScreenCaptureObserver_code == UINT32_MAX && relayoutAsync_code == UINT32_MAX &&
-        relayout_code == UINT32_MAX) {
+        relayout_code == UINT32_MAX && registerScreenRecordingCallback_code == UINT32_MAX) {
         LOGD("ERROR getTransactionCodes: Could not get any transaction codes");
         return false;
     }
@@ -72,7 +86,8 @@ int transactHook(void* self, int32_t handle, uint32_t code, void* pdata, void* p
     // matches any real `code` here, with no separate `code == 0` check
     // needed on this per-call path.
     if (likely(code != relayout_code && code != relayoutAsync_code &&
-               code != registerScreenCaptureObserver_code)) {
+               code != registerScreenCaptureObserver_code &&
+               code != registerScreenRecordingCallback_code)) {
         return transactOrig(self, handle, code, pdata, preply, flags);
     }
 
